@@ -68,6 +68,8 @@ class ModelConfig(BaseConfig):
     gradient_checkpointing: bool = False
     positional_encoding_size: int
     ia_bce_loss: bool = True
+    ssl_iou_threshold: float = 0.5
+    ssl_objectness_loss_coef: float = 0.0
     cls_loss_coef: float = 1.0
     segmentation_head: bool = False
     mask_downsample_ratio: int = 4
@@ -293,6 +295,7 @@ class TrainConfig(BaseModel):
     dataset_file: Literal["coco", "o365", "roboflow", "yolo"] = "roboflow"
     square_resize_div_64: bool = True
     dataset_dir: str
+    ssl_annotations_file: Optional[str] = None
     output_dir: str = "output"
     multi_scale: bool = True
     expanded_scales: bool = True
@@ -316,9 +319,9 @@ class TrainConfig(BaseModel):
     eval_max_dets: int = 500
     aug_config: Optional[Dict[str, Any]] = None
 
-    @field_validator("dataset_dir", "output_dir", mode="after")
+    @field_validator("dataset_dir", "output_dir", "ssl_annotations_file", mode="after")
     @classmethod
-    def expand_paths(cls, v: str) -> str:
+    def expand_paths(cls, v: Optional[str]) -> Optional[str]:
         """
         Expand user paths (e.g., '~' or paths with separators) but leave simple filenames
         (like 'rf-detr-base.pth') unchanged so they can match hosted model keys.

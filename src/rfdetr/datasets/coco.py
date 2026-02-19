@@ -18,6 +18,7 @@ COCO dataset which returns image_id for evaluation.
 
 Mostly copy-paste from https://github.com/pytorch/vision/blob/13b35ff/references/detection/coco_utils.py
 """
+import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -82,17 +83,55 @@ class CocoDetection(torchvision.datasets.CocoDetection):
             ann_file: Union[str, Path],
             transforms: Optional[Any],
             include_masks: bool = False,
+            ssl_annotations_file: Optional[Union[str, Path]] = None,
     ) -> None:
         super(CocoDetection, self).__init__(img_folder, ann_file)
         self._transforms = transforms
         self.include_masks = include_masks
         self.prepare = ConvertCoco(include_masks=include_masks)
+        self.ssl_boxes_by_image_id = self._load_ssl_boxes(ssl_annotations_file)
+
+    @staticmethod
+    def _load_ssl_boxes(ssl_annotations_file: Optional[Union[str, Path]]) -> Optional[Dict[int, torch.Tensor]]:
+        """Load SSL proposal boxes indexed by COCO image_id.
+
+        Args:
+            ssl_annotations_file: Optional COCO-format annotations file containing
+                proposal boxes to be used for SSL-only training.
+
+        Returns:
+            Mapping from image_id to proposal boxes in XYXY format, or ``None`` when
+            no SSL annotations file is provided.
+        """
+        if ssl_annotations_file is None:
+            return None
+
+        ssl_annotations_path = Path(ssl_annotations_file)
+        if not ssl_annotations_path.exists():
+            logger.error(f"SSL annotations file {ssl_annotations_path} does not exist")
+            raise FileNotFoundError(f"SSL annotations file {ssl_annotations_path} does not exist")
+
+        with ssl_annotations_path.open("r", encoding="utf-8") as f:
+            annotations = json.load(f)
+
+        ssl_boxes_by_image_id: Dict[int, List[List[float]]] = {}
+        for ann in annotations.get("annotations", []):
+            image_id = int(ann["image_id"])
+            x, y, w, h = ann["bbox"]
+            ssl_boxes_by_image_id.setdefault(image_id, []).append([x, y, x + w, y + h])
+
+        return {
+            image_id: torch.as_tensor(boxes, dtype=torch.float32).reshape(-1, 4)
+            for image_id, boxes in ssl_boxes_by_image_id.items()
+        }
 
     def __getitem__(self, idx: int) -> Tuple[Any, Any]:
         img, target = super(CocoDetection, self).__getitem__(idx)
         image_id = self.ids[idx]
         target = {'image_id': image_id, 'annotations': target}
         img, target = self.prepare(img, target)
+        if self.ssl_boxes_by_image_id is not None:
+            target["ssl_boxes"] = self.ssl_boxes_by_image_id.get(image_id, torch.zeros((0, 4), dtype=torch.float32)).clone()
         if self._transforms is not None:
             img, target = self._transforms(img, target)  # boxes are absolute [x_min, y_min, x_max, y_max]; conversion to normalized [cx, cy, w, h] occurs inside T.Normalize
         return img, target
@@ -319,6 +358,7 @@ def build_coco(image_set: str, args: Any, resolution: int) -> CocoDetection:
     square_resize_div_64 = getattr(args, 'square_resize_div_64', False)
     include_masks = getattr(args, "segmentation_head", False)
     aug_config = getattr(args, 'aug_config', None)
+    ssl_annotations_file = getattr(args, "ssl_annotations_file", None) if image_set == "train" else None
 
     if square_resize_div_64:
         logger.info(f"Building COCO {image_set} dataset with square resize at resolution {resolution}")
@@ -331,7 +371,7 @@ def build_coco(image_set: str, args: Any, resolution: int) -> CocoDetection:
             patch_size=args.patch_size,
             num_windows=args.num_windows,
             aug_config=aug_config,
-        ), include_masks=include_masks)
+        ), include_masks=include_masks, ssl_annotations_file=ssl_annotations_file)
     else:
         logger.info(f"Building COCO {image_set} dataset at resolution {resolution}")
         dataset = CocoDetection(img_folder, ann_file, transforms=make_coco_transforms(
@@ -343,7 +383,7 @@ def build_coco(image_set: str, args: Any, resolution: int) -> CocoDetection:
             patch_size=args.patch_size,
             num_windows=args.num_windows,
             aug_config=aug_config,
-        ), include_masks=include_masks)
+        ), include_masks=include_masks, ssl_annotations_file=ssl_annotations_file)
     return dataset
 
 def build_roboflow_from_coco(image_set: str, args: Any, resolution: int) -> CocoDetection:
@@ -372,6 +412,7 @@ def build_roboflow_from_coco(image_set: str, args: Any, resolution: int) -> Coco
     patch_size = getattr(args, "patch_size", 16)
     num_windows = getattr(args, "num_windows", 4)
     aug_config = getattr(args, "aug_config", None)
+    ssl_annotations_file = getattr(args, "ssl_annotations_file", None) if image_set == "train" else None
 
     if square_resize_div_64:
         logger.info(f"Building Roboflow {image_set} dataset with square resize at resolution {resolution}")
@@ -384,7 +425,7 @@ def build_roboflow_from_coco(image_set: str, args: Any, resolution: int) -> Coco
             patch_size=patch_size,
             num_windows=num_windows,
             aug_config=aug_config,
-        ), include_masks=include_masks)
+        ), include_masks=include_masks, ssl_annotations_file=ssl_annotations_file)
     else:
         logger.info(f"Building Roboflow {image_set} dataset at resolution {resolution}")
         dataset = CocoDetection(img_folder, ann_file, transforms=make_coco_transforms(
@@ -396,5 +437,5 @@ def build_roboflow_from_coco(image_set: str, args: Any, resolution: int) -> Coco
             patch_size=patch_size,
             num_windows=num_windows,
             aug_config=aug_config,
-        ), include_masks=include_masks)
+        ), include_masks=include_masks, ssl_annotations_file=ssl_annotations_file)
     return dataset
