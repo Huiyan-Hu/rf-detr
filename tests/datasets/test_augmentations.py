@@ -65,6 +65,23 @@ class TestAlbumentationsWrapper:
         assert torch.equal(aug_target['boxes'], target['boxes'])
         assert torch.equal(aug_target['labels'], target['labels'])
 
+    def test_geometric_transform_updates_ssl_boxes(self):
+        """Test geometric transforms also transform ssl_boxes."""
+        transform = A.HorizontalFlip(p=1.0)
+        wrapper = AlbumentationsWrapper(transform)
+
+        image = Image.new('RGB', (100, 100))
+        target = {
+            'boxes': torch.tensor([[10.0, 20.0, 30.0, 40.0]]),
+            'labels': torch.tensor([1]),
+            'ssl_boxes': torch.tensor([[40.0, 50.0, 70.0, 80.0]]),
+        }
+
+        _, aug_target = wrapper(image, target)
+
+        assert torch.allclose(aug_target['boxes'], torch.tensor([[70.0, 20.0, 90.0, 40.0]]), atol=1.0)
+        assert torch.allclose(aug_target['ssl_boxes'], torch.tensor([[30.0, 50.0, 60.0, 80.0]]), atol=1.0)
+
     def test_empty_boxes_handling(self):
         """Test wrapper handles empty boxes correctly."""
         transform = A.HorizontalFlip(p=1.0)

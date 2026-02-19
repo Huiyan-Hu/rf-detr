@@ -307,6 +307,8 @@ class SetCriterion(nn.Module):
                 use_varifocal_loss=False,
                 use_position_supervised_loss=False,
                 ia_bce_loss=False,
+                ssl_iou_threshold: float = 0.5,
+                ssl_objectness_loss_coef: float = 0.0,
                 mask_point_sample_ratio: int = 16,):
         """ Create the criterion.
         Parameters:
@@ -328,7 +330,38 @@ class SetCriterion(nn.Module):
         self.use_varifocal_loss = use_varifocal_loss
         self.use_position_supervised_loss = use_position_supervised_loss
         self.ia_bce_loss = ia_bce_loss
+        self.ssl_iou_threshold = ssl_iou_threshold
+        self.ssl_objectness_loss_coef = ssl_objectness_loss_coef
         self.mask_point_sample_ratio = mask_point_sample_ratio
+
+    def _build_ssl_ignore_mask(self, outputs, targets, indices):
+        """Build query-level ignore mask from SSL boxes.
+
+        Queries that overlap ``target['ssl_boxes']`` above ``ssl_iou_threshold`` are
+        ignored for supervised classification negatives. Matched GT queries remain
+        supervised and are never ignored.
+        """
+        pred_boxes = outputs['pred_boxes']
+        batch_size, num_queries = pred_boxes.shape[:2]
+        ignore_mask = torch.zeros((batch_size, num_queries), dtype=torch.bool, device=pred_boxes.device)
+
+        for batch_idx, target in enumerate(targets):
+            ssl_boxes = target.get("ssl_boxes", None)
+            if ssl_boxes is None or len(ssl_boxes) == 0:
+                continue
+
+            pred_xyxy = box_ops.box_cxcywh_to_xyxy(pred_boxes[batch_idx])
+            ssl_xyxy = box_ops.box_cxcywh_to_xyxy(ssl_boxes)
+            iou = box_ops.box_iou(pred_xyxy, ssl_xyxy)[0]
+            cur_ignore = iou.max(dim=1).values >= self.ssl_iou_threshold
+
+            matched_queries = indices[batch_idx][0]
+            if len(matched_queries) > 0:
+                cur_ignore[matched_queries] = False
+
+            ignore_mask[batch_idx] = cur_ignore
+
+        return ignore_mask
 
     def loss_labels(self, outputs, targets, indices, num_boxes, log=True):
         """Classification loss (Binary focal loss)
@@ -339,6 +372,7 @@ class SetCriterion(nn.Module):
 
         idx = self._get_src_permutation_idx(indices)
         target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
+        ignore_mask = self._build_ssl_ignore_mask(outputs, targets, indices)
 
         if self.ia_bce_loss:
             alpha = self.focal_alpha
@@ -363,6 +397,10 @@ class SetCriterion(nn.Module):
 
             pos_weights[pos_ind] = t.to(pos_weights.dtype)
             neg_weights[pos_ind] = 1 - t.to(neg_weights.dtype)
+            if ignore_mask.any():
+                ignored = ignore_mask.unsqueeze(-1)
+                pos_weights = pos_weights.masked_fill(ignored, 0)
+                neg_weights = neg_weights.masked_fill(ignored, 0)
             # a reformulation of the standard loss_ce = - pos_weights * prob.log() - neg_weights * (1 - prob).log()
             # with a focus on statistical stability by using fused logsigmoid
             loss_ce = neg_weights * src_logits - F.logsigmoid(src_logits) * (pos_weights + neg_weights)
@@ -386,6 +424,8 @@ class SetCriterion(nn.Module):
             pos_ind.append(target_classes_o)
             pos_ious_func = pos_ious_func.to(cls_iou_func_targets.dtype)
             cls_iou_func_targets[pos_ind] = pos_ious_func
+            if ignore_mask.any():
+                cls_iou_func_targets = cls_iou_func_targets.masked_fill(ignore_mask.unsqueeze(-1), 0)
             norm_cls_iou_func_targets = cls_iou_func_targets \
                 / (cls_iou_func_targets.view(cls_iou_func_targets.shape[0], -1, 1).amax(1, True) + 1e-8)
             loss_ce = position_supervised_loss(src_logits, norm_cls_iou_func_targets, num_boxes, alpha=self.focal_alpha, gamma=2) * src_logits.shape[1]
@@ -405,6 +445,8 @@ class SetCriterion(nn.Module):
             pos_ind=[id for id in idx]
             pos_ind.append(target_classes_o)
             cls_iou_targets[pos_ind] = pos_ious
+            if ignore_mask.any():
+                cls_iou_targets = cls_iou_targets.masked_fill(ignore_mask.unsqueeze(-1), 0)
             loss_ce = sigmoid_varifocal_loss(src_logits, cls_iou_targets, num_boxes, alpha=self.focal_alpha, gamma=2) * src_logits.shape[1]
         else:
             target_classes = torch.full(src_logits.shape[:2], self.num_classes,
@@ -416,8 +458,20 @@ class SetCriterion(nn.Module):
             target_classes_onehot.scatter_(2, target_classes.unsqueeze(-1), 1)
 
             target_classes_onehot = target_classes_onehot[:,:,:-1]
+            if ignore_mask.any():
+                target_classes_onehot = target_classes_onehot.masked_fill(ignore_mask.unsqueeze(-1), 0)
             loss_ce = sigmoid_focal_loss(src_logits, target_classes_onehot, num_boxes, alpha=self.focal_alpha, gamma=2) * src_logits.shape[1]
         losses = {'loss_ce': loss_ce}
+
+        if self.ssl_objectness_loss_coef > 0 and ignore_mask.any():
+            ssl_logits = src_logits[ignore_mask]
+            ssl_objectness = ssl_logits.sigmoid().amax(dim=-1)
+            losses['loss_ssl_objectness'] = F.binary_cross_entropy(
+                ssl_objectness,
+                torch.ones_like(ssl_objectness),
+            )
+        else:
+            losses['loss_ssl_objectness'] = src_logits.sum() * 0
 
         if log:
             # TODO this should probably be a separate loss, not hacked in this one here
@@ -861,6 +915,7 @@ def build_criterion_and_postprocessors(args):
     matcher = build_matcher(args)
     weight_dict = {'loss_ce': args.cls_loss_coef, 'loss_bbox': args.bbox_loss_coef}
     weight_dict['loss_giou'] = args.giou_loss_coef
+    weight_dict['loss_ssl_objectness'] = args.ssl_objectness_loss_coef
     if args.segmentation_head:
         weight_dict['loss_mask_ce'] = args.mask_ce_loss_coef
         weight_dict['loss_mask_dice'] = args.mask_dice_loss_coef
@@ -885,6 +940,8 @@ def build_criterion_and_postprocessors(args):
                                 use_varifocal_loss = args.use_varifocal_loss,
                                 use_position_supervised_loss=args.use_position_supervised_loss,
                                 ia_bce_loss=args.ia_bce_loss,
+                                ssl_iou_threshold=args.ssl_iou_threshold,
+                                ssl_objectness_loss_coef=args.ssl_objectness_loss_coef,
                                 mask_point_sample_ratio=args.mask_point_sample_ratio)
     else:
         criterion = SetCriterion(args.num_classes + 1, matcher=matcher, weight_dict=weight_dict,
@@ -892,7 +949,9 @@ def build_criterion_and_postprocessors(args):
                                 group_detr=args.group_detr, sum_group_losses=sum_group_losses,
                                 use_varifocal_loss = args.use_varifocal_loss,
                                 use_position_supervised_loss=args.use_position_supervised_loss,
-                                ia_bce_loss=args.ia_bce_loss)
+                                ia_bce_loss=args.ia_bce_loss,
+                                ssl_iou_threshold=args.ssl_iou_threshold,
+                                ssl_objectness_loss_coef=args.ssl_objectness_loss_coef)
     criterion.to(device)
     postprocess = PostProcess(num_select=args.num_select)
 

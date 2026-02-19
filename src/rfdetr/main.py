@@ -692,9 +692,12 @@ if __name__ == '__main__':
             "use_varifocal_loss",
             "use_position_supervised_loss",
             "ia_bce_loss",
+            "ssl_iou_threshold",
+            "ssl_objectness_loss_coef",
             "dataset_file",
             "coco_path",
             "dataset_dir",
+            "ssl_annotations_file",
             "square_resize_div_64",
             "output_dir",
             "checkpoint_interval",
@@ -835,11 +838,17 @@ def get_args_parser():
     parser.add_argument('--use_varifocal_loss', action='store_true')
     parser.add_argument('--use_position_supervised_loss', action='store_true')
     parser.add_argument('--ia_bce_loss', action='store_true')
+    parser.add_argument('--ssl_iou_threshold', default=0.5, type=float,
+                        help='IoU threshold to mark predictions overlapping ssl_boxes as ignore in supervised cls')
+    parser.add_argument('--ssl_objectness_loss_coef', default=0.0, type=float,
+                        help='Weight for SSL objectness loss on ignored queries')
 
     # dataset parameters
     parser.add_argument('--dataset_file', default="coco")
     parser.add_argument('--coco_path', type=str)
     parser.add_argument('--dataset_dir', type=str)
+    parser.add_argument('--ssl_annotations_file', type=str, default=None,
+                        help='Optional COCO-format annotations file for SSL proposal boxes aligned by image_id')
     parser.add_argument('--square_resize_div_64', action='store_true')
 
     parser.add_argument('--output_dir', default='output',
@@ -992,11 +1001,14 @@ def populate_args(
     use_varifocal_loss=False,
     use_position_supervised_loss=False,
     ia_bce_loss=False,
+    ssl_iou_threshold=0.5,
+    ssl_objectness_loss_coef=0.0,
 
     # Dataset parameters
     dataset_file="coco",
     coco_path=None,
     dataset_dir=None,
+    ssl_annotations_file=None,
     square_resize_div_64=False,
     aug_config=None,
 
@@ -1105,9 +1117,12 @@ def populate_args(
         use_varifocal_loss=use_varifocal_loss,
         use_position_supervised_loss=use_position_supervised_loss,
         ia_bce_loss=ia_bce_loss,
+        ssl_iou_threshold=ssl_iou_threshold,
+        ssl_objectness_loss_coef=ssl_objectness_loss_coef,
         dataset_file=dataset_file,
         coco_path=coco_path,
         dataset_dir=dataset_dir,
+        ssl_annotations_file=ssl_annotations_file,
         square_resize_div_64=square_resize_div_64,
         aug_config=aug_config,
         output_dir=output_dir,

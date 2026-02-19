@@ -63,6 +63,14 @@ def crop(image: PIL.Image.Image, target: Dict[str, Any], region: Tuple[int, int,
         target["area"] = area
         fields.append("boxes")
 
+    if "ssl_boxes" in target:
+        ssl_boxes = target["ssl_boxes"]
+        max_size = torch.as_tensor([w, h], dtype=torch.float32)
+        cropped_ssl_boxes = ssl_boxes - torch.as_tensor([j, i, j, i])
+        cropped_ssl_boxes = torch.min(cropped_ssl_boxes.reshape(-1, 2, 2), max_size)
+        cropped_ssl_boxes = cropped_ssl_boxes.clamp(min=0)
+        target["ssl_boxes"] = cropped_ssl_boxes.reshape(-1, 4)
+
     if "masks" in target:
         # FIXME should we update the area here if there are no boxes?
         target['masks'] = target['masks'][:, i:i + h, j:j + w]
@@ -94,6 +102,11 @@ def hflip(image: PIL.Image.Image, target: Dict[str, Any]) -> Tuple[PIL.Image.Ima
         boxes = target["boxes"]
         boxes = boxes[:, [2, 1, 0, 3]] * torch.as_tensor([-1, 1, -1, 1]) + torch.as_tensor([w, 0, w, 0])
         target["boxes"] = boxes
+
+    if "ssl_boxes" in target:
+        ssl_boxes = target["ssl_boxes"]
+        ssl_boxes = ssl_boxes[:, [2, 1, 0, 3]] * torch.as_tensor([-1, 1, -1, 1]) + torch.as_tensor([w, 0, w, 0])
+        target["ssl_boxes"] = ssl_boxes
 
     if "masks" in target:
         target['masks'] = target['masks'].flip(-1)
@@ -146,6 +159,12 @@ def resize(image: PIL.Image.Image, target: Optional[Dict[str, Any]], size: Union
         scaled_boxes = boxes * torch.as_tensor(
             [ratio_width, ratio_height, ratio_width, ratio_height])
         target["boxes"] = scaled_boxes
+
+    if "ssl_boxes" in target:
+        ssl_boxes = target["ssl_boxes"]
+        scaled_ssl_boxes = ssl_boxes * torch.as_tensor(
+            [ratio_width, ratio_height, ratio_width, ratio_height])
+        target["ssl_boxes"] = scaled_ssl_boxes
 
     if "area" in target:
         area = target["area"]
@@ -465,6 +484,11 @@ class Normalize(object):
             boxes = box_xyxy_to_cxcywh(boxes)
             boxes = boxes / torch.tensor([w, h, w, h], dtype=torch.float32)
             target["boxes"] = boxes
+        if "ssl_boxes" in target:
+            ssl_boxes = target["ssl_boxes"]
+            ssl_boxes = box_xyxy_to_cxcywh(ssl_boxes)
+            ssl_boxes = ssl_boxes / torch.tensor([w, h, w, h], dtype=torch.float32)
+            target["ssl_boxes"] = ssl_boxes
         return image, target
 
 
@@ -587,7 +611,7 @@ class AlbumentationsWrapper:
                 [transform],
                 bbox_params=A.BboxParams(
                     format='pascal_voc',  # Boxes are in (x1, y1, x2, y2) format
-                    label_fields=['category_ids', 'idxs'],  # Track labels and indices for per-instance field sync
+                    label_fields=['category_ids', 'idxs', 'is_ssl'],  # Track labels and indices for per-instance field sync
                     min_visibility=0.0,   # Remove boxes with zero visibility/area after transformation
                     clip=True,  # Clip box coordinates to image boundaries after transformation
                 )
@@ -691,7 +715,9 @@ class AlbumentationsWrapper:
         self,
         image_np: np.ndarray,
         target: Dict[str, Any],
-        labels: List[int]
+        labels: List[int],
+        is_ssl: List[int],
+        per_instance_target: Optional[Dict[str, Any]] = None,
     ) -> Tuple[Image.Image, Dict[str, Any]]:
         """Apply geometric transform to image with boxes and optionally masks.
 
@@ -716,7 +742,9 @@ class AlbumentationsWrapper:
         torch.Size([1, 4])
         """
         boxes_np = self._boxes_to_numpy(target["boxes"])
+        instance_target = per_instance_target if per_instance_target is not None else target
         num_boxes = boxes_np.shape[0]
+        num_instance_boxes = len(instance_target.get("boxes", []))
         # Track indices to keep per-instance fields synchronized
         idxs = list(range(num_boxes))
         masks_list = None
@@ -728,16 +756,17 @@ class AlbumentationsWrapper:
             masks_list = [mask for mask in masks_np]
         # Apply transform
         transform_kwargs = {
-            "image": image_np, "bboxes": boxes_np, "category_ids": labels, "idxs": idxs
+            "image": image_np, "bboxes": boxes_np, "category_ids": labels, "idxs": idxs, "is_ssl": is_ssl
         }
         if masks_list is not None:
             transform_kwargs["masks"] = masks_list
         augmented = self.transform(**transform_kwargs)
         target_out: Dict[str, Any] = target.copy()
         bboxes_aug = augmented["bboxes"]
+        is_ssl_aug = augmented["is_ssl"]
         kept_idxs = augmented.get("idxs", idxs)
         # Update target with transformed boxes and labels
-        if len(bboxes_aug) == 0:
+        if len(bboxes_aug) == 0 or sum(1 for marker in is_ssl_aug if marker == 0) == 0:
             target_out["boxes"] = torch.zeros((0, 4), dtype=torch.float32)
             target_out["labels"] = torch.zeros((0,), dtype=torch.long)
             # Explicitly clear masks when all boxes are removed; _clear_per_instance_fields
@@ -745,11 +774,22 @@ class AlbumentationsWrapper:
             if "masks" in target:
                 img_height, img_width = image_np.shape[:2]
                 target_out["masks"] = torch.zeros((0, img_height, img_width), dtype=torch.bool)
-            target_out.update(self._clear_per_instance_fields(target, num_boxes))
+            target_out.update(self._clear_per_instance_fields(instance_target, num_instance_boxes))
         else:
-            target_out["boxes"] = torch.as_tensor(bboxes_aug, dtype=torch.float32).reshape(-1, 4)
-            target_out["labels"] = torch.tensor(augmented["category_ids"], dtype=torch.long)
-            target_out.update(self._filter_per_instance_fields(target, num_boxes, kept_idxs))
+            target_out["boxes"] = torch.as_tensor(
+                [box for box, marker in zip(bboxes_aug, is_ssl_aug) if marker == 0], dtype=torch.float32
+            ).reshape(-1, 4)
+            target_out["labels"] = torch.tensor(
+                [label for label, marker in zip(augmented["category_ids"], is_ssl_aug) if marker == 0], dtype=torch.long
+            )
+            kept_main_idxs = [idx for idx, marker in zip(kept_idxs, is_ssl_aug) if marker == 0]
+            target_out.update(self._filter_per_instance_fields(instance_target, num_instance_boxes, kept_main_idxs))
+        if "ssl_boxes" in target:
+            ssl_boxes_aug = [box for box, marker in zip(bboxes_aug, is_ssl_aug) if marker == 1]
+            if len(ssl_boxes_aug) == 0:
+                target_out["ssl_boxes"] = torch.zeros((0, 4), dtype=torch.float32)
+            else:
+                target_out["ssl_boxes"] = torch.as_tensor(ssl_boxes_aug, dtype=torch.float32).reshape(-1, 4)
         image_out = Image.fromarray(augmented["image"])
         if masks_list is not None and "masks" in augmented:
             height, width = augmented["image"].shape[:2]
@@ -814,6 +854,19 @@ class AlbumentationsWrapper:
 
         # Convert labels tensor to Python list (required by Albumentations category_ids)
         labels = target["labels"].cpu().tolist() if torch.is_tensor(target["labels"]) else list(target["labels"])
+        labels_for_transform = labels
+        is_ssl = [0 for _ in labels]
+        target_for_transform = target
+        if self._is_geometric and "ssl_boxes" in target and "masks" not in target:
+            ssl_boxes = target["ssl_boxes"]
+            if len(ssl_boxes) > 0:
+                ssl_labels = [-1 for _ in range(len(ssl_boxes))]
+                merged_boxes = torch.cat((target["boxes"], ssl_boxes), dim=0)
+                labels_for_transform = labels + ssl_labels
+                is_ssl = [0 for _ in labels] + [1 for _ in ssl_labels]
+                target_for_transform = target.copy()
+                target_for_transform["boxes"] = merged_boxes
+                target_for_transform["labels"] = torch.tensor(labels_for_transform, dtype=torch.long)
 
         # === Apply Transform ===
         if self._is_geometric and "masks" in target and "boxes" not in target:
@@ -823,7 +876,13 @@ class AlbumentationsWrapper:
             )
         if self._is_geometric and "boxes" in target:
             # Geometric path: transform image and boxes together
-            image_out, target_out = self._apply_geometric_transform(image_np, target, labels)
+            image_out, target_out = self._apply_geometric_transform(
+                image_np,
+                target_for_transform,
+                labels_for_transform,
+                is_ssl,
+                per_instance_target=target,
+            )
         else:
             # Non-geometric path: transform image only
             augmented = self.transform(image=image_np)
